@@ -1,6 +1,15 @@
-import { App, SuggestModal, Plugin, PluginSettingTab, Setting, Notice } from "obsidian";
+import {
+	App,
+	SuggestModal,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	Notice,
+	MarkdownView,
+	debounce,
+	Debouncer,
+} from "obsidian";
 
-import Typed from "typed.js";
 import * as path from "path";
 
 import { oneLine } from "common-tags";
@@ -10,12 +19,14 @@ import {
 	Configuration,
 	OpenAIApi,
 	CreateModerationResponse,
+	ChatCompletionRequestMessage,
 } from "openai-edge";
 
 // Local things
 import { generateEmbeddings } from "./generate-embeddings";
 import { generativeSearch, semanticSearch } from "./search";
 import { truncateString, removeMarkdown } from "./utils";
+import { config } from "./config";
 
 interface SearchSettings {
 	matchThreshold: number;
@@ -28,6 +39,14 @@ interface ObsidianAISettings {
 	supabaseKey: string;
 	openaiKey: string;
 	indexOnOpen: boolean;
+
+	embeddingModel: string;
+	chatModel: string;
+	charsFromPreviousParagraph: number;
+	minParagraphSize: number;
+	maxParagraphSize: number;
+	searchAsYouType: boolean;
+	minLengthBeforeAutoSearch: number;
 
 	// Directory settings
 	excludedDirs: string;
@@ -48,28 +67,37 @@ const DEFAULT_SETTINGS: ObsidianAISettings = {
 	openaiKey: "",
 	indexOnOpen: false,
 
+	embeddingModel: config.embeddingModel,
+	chatModel: config.chatModel,
+	charsFromPreviousParagraph: config.charsFromPreviousParagraph,
+	minParagraphSize: config.minParagraphSize,
+	maxParagraphSize: config.maxParagraphSize,
+	searchAsYouType: false,
+	minLengthBeforeAutoSearch: config.minLengthBeforeAutoSearch,
+
 	excludedDirs: "",
 	excludedDirsList: [],
 
 	publicDirs: "",
 	publicDirsList: [],
 
-	prompt: oneLine`Your name is Obsidian, you are a 22-year-old university student who studies
-		Electronics and Electrical Engineering at University College London. Given
-		the following sections from your notes, answer the question with the provided information. If
-		you are unsure, and the notes don't include relevant information, you may also say
-		"Sorry, I don't know the answer to this question :("`,
+	prompt: oneLine`You are an AI assistant that answers in two clear parts.
+	
+	First, provide a brief answer using ONLY information from the provided context. If you cannot find the answer, say "I cannot find this in the available information."
+	Then, if relevant, add a short "Additional Context:" section with helpful supplemental knowledge.
+
+	Keep all responses concise and to the point.`,
 
 	semanticSearch: {
-		matchThreshold: 0.78,
+		matchThreshold: 0.3,
 		matchCount: 10,
-		minContentLength: 50,
+		minContentLength: 10,
 	},
 
 	generativeSearch: {
-		matchThreshold: 0.78,
+		matchThreshold: 0.3,
 		matchCount: 10,
-		minContentLength: 50,
+		minContentLength: 10,
 	},
 };
 
@@ -95,7 +123,7 @@ export default class ObsidianAIPlugin extends Plugin {
 						persistSession: false,
 						autoRefreshToken: false,
 					},
-				}
+				},
 			);
 		}
 
@@ -147,25 +175,28 @@ export default class ObsidianAIPlugin extends Plugin {
 						this.supabaseClient,
 						this.openai,
 						this.settings.excludedDirsList,
-						this.settings.publicDirsList
-					)
-						.then((result) => {
-							if (result.errorCount == 0) {
-								this.statusBarItemEl.setText("✨ [AI] Loaded");
-								new Notice(`Successfully indexed ${result.successCount} documents with ${result.updatedCount} updates! Removed ${result.deleteCount} deleted documents.`);
-							} else {
-								this.statusBarItemEl.setText("😔 [AI] Error");
-								new Notice(`There were ${result.errorCount} errors! View developer console for more information.`);
-							}
-						});
+						this.settings.publicDirsList,
+					).then((result) => {
+						if (result.errorCount == 0) {
+							this.statusBarItemEl.setText("✨ [AI] Loaded");
+							new Notice(
+								`Successfully indexed ${result.successCount} documents with ${result.updatedCount} updates! Removed ${result.deleteCount} deleted documents.`,
+							);
+						} else {
+							this.statusBarItemEl.setText("😔 [AI] Error");
+							new Notice(
+								`There were ${result.errorCount} errors! View developer console for more information.`,
+							);
+						}
+					});
 				}
 			});
 		}
 
 		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: "ai-search",
-			name: "AI Search",
+			id: "ali-ai-search",
+			name: "Ali AI Search",
 			checkCallback: (checking: boolean) => {
 				if (this.supabaseClient !== null && this.openai !== null) {
 					if (!checking) {
@@ -175,7 +206,9 @@ export default class ObsidianAIPlugin extends Plugin {
 							this.openai,
 							this.settings.prompt,
 							this.settings.semanticSearch,
-							this.settings.generativeSearch
+							this.settings.generativeSearch,
+							this.settings.searchAsYouType,
+							this.settings.minLengthBeforeAutoSearch,
 						).open();
 					}
 
@@ -197,15 +230,18 @@ export default class ObsidianAIPlugin extends Plugin {
 							this.supabaseClient,
 							this.openai,
 							this.settings.excludedDirsList,
-							this.settings.publicDirsList
-						)
-						.then((result) => {
+							this.settings.publicDirsList,
+						).then((result) => {
 							if (result.errorCount == 0) {
 								this.statusBarItemEl.setText("✨ [AI] Loaded");
-								new Notice(`Successfully indexed ${result.successCount} documents with ${result.updatedCount} updates! Removed ${result.deleteCount} deleted documents.`);
+								new Notice(
+									`Successfully indexed ${result.successCount} documents with ${result.updatedCount} updates! Removed ${result.deleteCount} deleted documents.`,
+								);
 							} else {
 								this.statusBarItemEl.setText("😔 [AI] Error");
-								new Notice(`There were ${result.errorCount} errors! View developer console for more information.`);
+								new Notice(
+									`There were ${result.errorCount} errors! View developer console for more information.`,
+								);
 							}
 						});
 					}
@@ -218,13 +254,13 @@ export default class ObsidianAIPlugin extends Plugin {
 		});
 	}
 
-	onunload() { }
+	onunload() {}
 
 	async loadSettings() {
 		this.settings = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
-			await this.loadData()
+			await this.loadData(),
 		);
 	}
 
@@ -247,13 +283,27 @@ interface SearchResult {
 type KeyListener = (event: KeyboardEvent) => void;
 
 class AISearchModal extends SuggestModal<SearchResult> {
-	private keyListener: KeyListener;
-	private supabaseClient: SupabaseClient;
+	private triggerChatListener: KeyListener;
+	private chatSendListener: KeyListener;
 	private prompt: string;
-	private typedInstance: Typed;
+	private readonly debouncedSearch: Debouncer<
+		[query: string],
+		SearchResult[]
+	>;
+	private results: SearchResult[] = [];
+	private searchQuery: string = "";
+	private searchAsYouType: boolean;
+	private minLengthBeforeAutoSearch: number;
+
+	// APIs
+	private supabaseClient: SupabaseClient;
 	private openai: OpenAIApi;
+
+	// Settings
 	private semanticSearchSettings: SearchSettings;
 	private generativeSearchSettings: SearchSettings;
+
+	private chatInput: HTMLInputElement;
 
 	constructor(
 		app: App,
@@ -261,7 +311,9 @@ class AISearchModal extends SuggestModal<SearchResult> {
 		openai: OpenAIApi,
 		prompt: string,
 		semanticSearchSettings: SearchSettings,
-		generativeSearchSettings: SearchSettings
+		generativeSearchSettings: SearchSettings,
+		searchAsYouType: boolean,
+		minLengthBeforeAutoSearch: number,
 	) {
 		super(app);
 
@@ -270,12 +322,18 @@ class AISearchModal extends SuggestModal<SearchResult> {
 		this.prompt = prompt;
 		this.semanticSearchSettings = semanticSearchSettings;
 		this.generativeSearchSettings = generativeSearchSettings;
+		this.searchAsYouType = searchAsYouType;
+		this.minLengthBeforeAutoSearch = minLengthBeforeAutoSearch;
 
+		if (this.searchAsYouType === true) {
+			this.debouncedSearch = debounce(this.getSuggestionsInternal, 1000);
+		}
 		// Adding the instructions
 		const instructions = [
 			["↑↓", "to navigate"],
 			["↵", "to open"],
-			["shift ↵", "to ask"],
+			["Alt ↵", "to search"],
+			["shift ↵", "to ask LLM"],
 			["esc", "to dismiss"],
 		];
 		const modalInstructionsHTML = this.modalEl.createEl("div", {
@@ -304,7 +362,7 @@ class AISearchModal extends SuggestModal<SearchResult> {
 		});
 		promptAnswerHTML.createSpan({
 			cls: "obsidian-ai-tools-answer",
-			text: "press shift ↵ to generate answer",
+			text: "press alt ↵ to search or shift ↵ to generate answer",
 		});
 		leadingPromptHTML.createDiv({
 			cls: "prompt-subheading",
@@ -312,106 +370,198 @@ class AISearchModal extends SuggestModal<SearchResult> {
 		});
 		this.resultContainerEl.before(leadingPromptHTML);
 
+		// Programmatically build the AI chat interface
+		const chatContainerHTML = document.createElement("div");
+		chatContainerHTML.addClass("chat-container");
+		chatContainerHTML.style.display = "none";
+
+		const backButton = chatContainerHTML.createEl("button", {
+			cls: "chat-back-button",
+			text: "←",
+		});
+		const messageContainer = chatContainerHTML.createDiv({
+			cls: "chat-messages",
+		});
+		const chatInputContainer = chatContainerHTML.createDiv({
+			cls: "chat-input-container",
+		});
+		this.chatInput = chatInputContainer.createEl("input", {
+			type: "search",
+			cls: "chat-input",
+			placeholder: "Type your message...",
+		});
+
+		this.resultContainerEl.before(chatContainerHTML);
+
+		const backButtonListener = async (_: MouseEvent) => {
+			// Register AI chat handlers
+			const promptInput = document.querySelector(
+				".prompt-input-container",
+			) as HTMLElement;
+			const promptLeading = document.querySelector(
+				".prompt-leading",
+			) as HTMLElement;
+			const promptResults = document.querySelector(
+				".prompt-results",
+			) as HTMLElement;
+
+			promptInput.style.display = "block";
+			promptLeading.style.display = "block";
+			promptResults.style.display = "block";
+			chatContainerHTML.style.display = "none";
+
+			document.removeEventListener("click", backButtonListener);
+			document.removeEventListener("keydown", this.chatSendListener);
+			document.addEventListener("keydown", this.triggerChatListener);
+		};
+
+		backButton.addEventListener("click", backButtonListener);
+
+		const addMessage = (sender: string, text: string) => {
+			const messageDiv = document.createElement("div");
+			messageDiv.className = "message " + sender;
+
+			const messageSender = document.createElement("div");
+			messageSender.className = "message-sender";
+			messageSender.textContent = sender + ":";
+
+			const messageText = document.createElement("div");
+			messageText.className = "message-text";
+			messageText.textContent = text;
+
+			messageDiv.appendChild(messageSender);
+			messageDiv.appendChild(messageText);
+
+			messageContainer.appendChild(messageDiv);
+		};
+
+		// Setting up the API call context
+		const messageHistory: ChatCompletionRequestMessage[] = [];
+		messageHistory.push({ role: "system", content: this.prompt });
+
+		this.chatSendListener = async (event: KeyboardEvent) => {
+			if (event.shiftKey && event.key === "Enter") {
+				const message = this.chatInput.value.trim();
+				if (message !== "") {
+					addMessage("you", message);
+					this.chatInput.value = "";
+
+					const res = await generativeSearch(
+						this.supabaseClient,
+						this.openai,
+						message,
+						messageHistory,
+						this.generativeSearchSettings.matchThreshold,
+						this.generativeSearchSettings.matchCount,
+						this.generativeSearchSettings.minContentLength,
+					);
+
+					addMessage("assistant", res);
+					messageHistory.push({ role: "assistant", content: res });
+				}
+			}
+		};
+
 		// Setting the placeholder
 		this.setPlaceholder("Enter query to ✨ AI ✨ search...");
 	}
 
 	onOpen(): void {
-		this.keyListener = async (event: KeyboardEvent) => {
+		this.triggerChatListener = async (event: KeyboardEvent) => {
+			// the pure enter does not trigget this - i assume something else is changing it....
+			if (event.altKey && event.key === "Enter") {
+				this.getSuggestionsInternal(this.inputEl.value, true);
+			}
 			if (event.shiftKey && event.key === "Enter") {
-				if (this.typedInstance) {
-					this.typedInstance.destroy();
-				}
+				this.chatInput.value = this.inputEl.value;
+				// Disable answer boxes
+				const promptInput = document.querySelector(
+					".prompt-input-container",
+				) as HTMLElement;
+				const promptLeading = document.querySelector(
+					".prompt-leading",
+				) as HTMLElement;
+				const promptResults = document.querySelector(
+					".prompt-results",
+				) as HTMLElement;
 
-				this.typedInstance = new Typed(".obsidian-ai-tools-answer", {
-					strings: ["Thinking..."],
-					typeSpeed: 50,
-					showCursor: false,
-				});
+				promptInput.style.display = "none";
+				promptLeading.style.display = "none";
+				promptResults.style.display = "none";
 
-				// Get prompt input
-				const inputEl = document.querySelector(
-					".prompt-input"
-				) as HTMLInputElement;
+				// Enable chat boxes
+				const chatContainer = document.querySelector(
+					".chat-container",
+				) as HTMLElement;
+				chatContainer.style.display = "block";
 
-				const query = inputEl.value;
-				// Sanitize input query
-				// Moderate the content to comply with OpenAI T&C
-				const moderationResponse: CreateModerationResponse =
-					await this.openai
-						.createModeration({ input: query.trim() })
-						.then((res) => res.json());
-
-				const [moderationRes] = moderationResponse.results;
-
-				if (moderationRes.flagged) {
-					throw new Error("Flagged content");
-				}
-
-				try {
-					const answer = await generativeSearch(
-						this.supabaseClient,
-						this.openai,
-						query,
-						this.prompt,
-						this.generativeSearchSettings.matchThreshold,
-						this.generativeSearchSettings.matchCount,
-						this.generativeSearchSettings.minContentLength
-					);
-
-					if (this.typedInstance) {
-						this.typedInstance.destroy();
-					}
-					this.typedInstance = new Typed(".obsidian-ai-tools-answer", {
-						strings: [answer ?? "No answer"],
-						typeSpeed: 75,
-						showCursor: false,
-					});
-
-				} catch(err) {
-					new Notice(`Error: ${err.message}`);
-				}
+				document.removeEventListener(
+					"keydown",
+					this.triggerChatListener,
+				);
+				document.addEventListener("keydown", this.chatSendListener);
 			}
 		};
 
-		document.addEventListener("keydown", this.keyListener);
+		document.addEventListener("keydown", this.triggerChatListener);
 	}
 
 	onClose(): void {
-		// Kill old typed instance if any
-		if (this.typedInstance) {
-			this.typedInstance.destroy();
+		document.removeEventListener("keydown", this.chatSendListener);
+		document.removeEventListener("keydown", this.triggerChatListener);
+	}
+
+	async getSuggestions(query: string): Promise<SearchResult[]> {
+		if (this.searchAsYouType === true) {
+			this.debouncedSearch(query);
 		}
-		document.removeEventListener("keydown", this.keyListener);
+		return this.results;
 	}
 
 	// Returns all available suggestions.
-	async getSuggestions(query: string): Promise<SearchResult[]> {
-		// Sanitize input query
-		// Moderate the content to comply with OpenAI T&C
-		const moderationResponse: CreateModerationResponse = await this.openai
-			.createModeration({ input: query.trim() })
-			.then((res) => res.json());
+	async getSuggestionsInternal(query: string, forceDespiteLength = false) {
+		if (
+			query.trim() != this.searchQuery.trim() &&
+			(query.length > this.minLengthBeforeAutoSearch ||
+				forceDespiteLength)
+		) {
+			this.searchQuery = query;
+			// Sanitize input query
+			// Moderate the content to comply with OpenAI T&C
+			console.log("Looking at suggestions for:", query);
+			const moderationResponse: CreateModerationResponse =
+				await this.openai
+					.createModeration({ input: query.trim() })
+					.then((res) => res.json());
 
-		const [moderationRes] = moderationResponse.results;
+			const [moderationRes] = moderationResponse.results;
 
-		if (moderationRes.flagged) {
-			throw new Error("Flagged content");
-		}
+			if (moderationRes.flagged) {
+				this.results = [];
+				//@ts-ignore
+				this.updateSuggestions();
 
-		try {
-			const results: SearchResult[] = await semanticSearch(
-				this.supabaseClient,
-				this.openai,
-				query,
-				this.semanticSearchSettings.matchThreshold,
-				this.semanticSearchSettings.matchCount,
-				this.semanticSearchSettings.minContentLength
-			);
-			return results;
-		} catch(err) {
-			new Notice(`Error: ${err.message}`);
-			return [];
+				throw new Error("Flagged content");
+			}
+
+			try {
+				const results: SearchResult[] = await semanticSearch(
+					this.supabaseClient,
+					this.openai,
+					query,
+					this.semanticSearchSettings.matchThreshold,
+					this.semanticSearchSettings.matchCount,
+					this.semanticSearchSettings.minContentLength,
+				);
+				this.results = results;
+			} catch (err) {
+				console.error("ARGH- failed", err);
+				new Notice(`Error: ${err.message}`);
+				this.results = [];
+			}
+
+			//@ts-ignore
+			this.updateSuggestions();
 		}
 	}
 
@@ -420,9 +570,12 @@ class AISearchModal extends SuggestModal<SearchResult> {
 		const name = path.parse(result.document.path).name;
 		el.classList.add("prompt-suggestion-item");
 		el.createEl("div", { cls: "prompt-suggestion-header", text: name });
+		// combine similarity (as a percentage) and first 200 characters of content
+		const similarity = Math.round(parseFloat(result.similarity) * 100);
+		const content = truncateString(removeMarkdown(result.content), 200);
 		el.createEl("div", {
 			cls: "prompt-suggestion-content",
-			text: truncateString(removeMarkdown(result.content), 200),
+			text: `${similarity}% - ${content}`,
 		});
 	}
 
@@ -432,9 +585,21 @@ class AISearchModal extends SuggestModal<SearchResult> {
 		const files = this.app.vault.getMarkdownFiles();
 		const selected = files.find(
 			(file) =>
-				path.resolve(file.path) === path.resolve(result.document.path)
+				path.resolve(file.path) === path.resolve(result.document.path),
 		);
-		if (selected) leaf.openFile(selected);
+		if (selected)
+			leaf.openFile(selected).then(() => {
+				const view = leaf.view;
+				if (view instanceof MarkdownView && view.editor) {
+					const text = result.content;
+					const content = view.editor.getValue();
+					const position = content.indexOf(text);
+					if (position !== -1) {
+						const pos = view.editor.offsetToPos(position);
+						view.editor.setCursor(pos);
+					}
+				}
+			});
 	}
 }
 
@@ -454,7 +619,7 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Excluded Directories")
 			.setDesc(
-				"Enter a list of comma-seperated paths to exclude from indexing"
+				"Enter a list of comma-seperated paths to exclude from indexing",
 			)
 			.addTextArea((text) =>
 				text
@@ -466,13 +631,13 @@ class SettingTab extends PluginSettingTab {
 							.split(",")
 							.map((path) => path.trim());
 						await this.plugin.saveSettings();
-					})
+					}),
 			);
 
 		new Setting(containerEl)
 			.setName("Public Directories")
 			.setDesc(
-				"Enter a list of comma-seperated paths to expose to the public"
+				"Enter a list of comma-seperated paths to expose to the public",
 			)
 			.addTextArea((text) =>
 				text
@@ -484,13 +649,13 @@ class SettingTab extends PluginSettingTab {
 							.split(",")
 							.map((path) => path.trim());
 						await this.plugin.saveSettings();
-					})
+					}),
 			);
 
 		new Setting(containerEl)
 			.setName("Prompt")
 			.setDesc(
-				"Enter a prompt, you can customise the name and instructions"
+				"Enter a prompt, you can customise the name and instructions",
 			)
 			.addTextArea((text) =>
 				text
@@ -499,7 +664,7 @@ class SettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.prompt = oneLine`${value}`;
 						await this.plugin.saveSettings();
-					})
+					}),
 			);
 
 		new Setting(containerEl)
@@ -511,7 +676,7 @@ class SettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.indexOnOpen = value;
 						await this.plugin.saveSettings();
-					})
+					}),
 			);
 
 		containerEl.createEl("div", {
@@ -527,7 +692,7 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.supabaseUrl = value;
 					await this.plugin.saveSettings();
 					this.plugin.setupSupabase();
-				})
+				}),
 		);
 
 		new Setting(containerEl)
@@ -540,7 +705,7 @@ class SettingTab extends PluginSettingTab {
 						this.plugin.settings.supabaseKey = value;
 						await this.plugin.saveSettings();
 						this.plugin.setupSupabase();
-					})
+					}),
 			);
 
 		new Setting(containerEl).setName("OpenAI API Key").addText((text) =>
@@ -551,8 +716,67 @@ class SettingTab extends PluginSettingTab {
 					this.plugin.settings.openaiKey = value;
 					await this.plugin.saveSettings();
 					this.plugin.setupOpenai();
-				})
+				}),
 		);
+
+		new Setting(containerEl)
+			.setName("Embedding Model")
+			.setDesc("The OpenAI model used for embeddings (read-only)")
+			.addText((text) =>
+				text
+					.setValue(this.plugin.settings.embeddingModel)
+					.setDisabled(true),
+			);
+
+		new Setting(containerEl)
+			.setName("Chat Model")
+			.setDesc("The OpenAI model used for chat completions (read-only)")
+			.addText((text) =>
+				text.setValue(this.plugin.settings.chatModel).setDisabled(true),
+			);
+
+		new Setting(containerEl)
+			.setName("Overlap from previous paragraph")
+			.setDesc(
+				"Number of characters to overlap from previous paragraph (read-only)",
+			)
+			.addText((text) =>
+				text
+					.setValue(
+						this.plugin.settings.charsFromPreviousParagraph.toString(),
+					)
+					.setDisabled(true),
+			);
+
+		new Setting(containerEl)
+			.setName("Min Chunk Size")
+			.setDesc("Min chunk size for embeddings (read-only)")
+			.addText((text) =>
+				text
+					.setValue(this.plugin.settings.minParagraphSize.toString())
+					.setDisabled(true),
+			);
+
+		new Setting(containerEl)
+			.setName("Max Chunk Size")
+			.setDesc("Max chunk size for embeddings (read-only)")
+			.addText((text) =>
+				text
+					.setValue(this.plugin.settings.maxParagraphSize.toString())
+					.setDisabled(true),
+			);
+
+		new Setting(containerEl)
+			.setName("Search As You Type")
+			.setDesc("Search as you type (debounce 1s) OR on Alt + Enter")
+			.addToggle((component) =>
+				component
+					.setValue(this.plugin.settings.searchAsYouType)
+					.onChange(async (value) => {
+						this.plugin.settings.searchAsYouType = value;
+						await this.plugin.saveSettings();
+					}),
+			);
 
 		containerEl.createEl("div", {
 			cls: "setting-item setting-item-heading",
@@ -562,13 +786,13 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Match Threshold")
 			.setDesc(
-				"The minimum similarity score to return a match (between 0 and 1)"
+				"The minimum similarity score to return a match (between 0 and 1)",
 			)
 			.addText((text) =>
 				text
 					.setPlaceholder("Enter number")
 					.setValue(
-						this.plugin.settings.semanticSearch.matchThreshold.toString()
+						this.plugin.settings.semanticSearch.matchThreshold.toString(),
 					)
 					.onChange(async (value) => {
 						if (!isNaN(parseInt(value))) {
@@ -576,7 +800,7 @@ class SettingTab extends PluginSettingTab {
 								parseFloat(value);
 							await this.plugin.saveSettings();
 						}
-					})
+					}),
 			);
 
 		new Setting(containerEl)
@@ -586,7 +810,7 @@ class SettingTab extends PluginSettingTab {
 				text
 					.setPlaceholder("Enter integer")
 					.setValue(
-						this.plugin.settings.semanticSearch.matchCount.toString()
+						this.plugin.settings.semanticSearch.matchCount.toString(),
 					)
 					.onChange(async (value) => {
 						if (!isNaN(parseInt(value))) {
@@ -594,7 +818,7 @@ class SettingTab extends PluginSettingTab {
 								parseInt(value);
 							await this.plugin.saveSettings();
 						}
-					})
+					}),
 			);
 
 		new Setting(containerEl)
@@ -604,7 +828,7 @@ class SettingTab extends PluginSettingTab {
 				text
 					.setPlaceholder("Enter integer")
 					.setValue(
-						this.plugin.settings.semanticSearch.minContentLength.toString()
+						this.plugin.settings.semanticSearch.minContentLength.toString(),
 					)
 					.onChange(async (value) => {
 						if (!isNaN(parseInt(value))) {
@@ -612,7 +836,7 @@ class SettingTab extends PluginSettingTab {
 								parseInt(value);
 							await this.plugin.saveSettings();
 						}
-					})
+					}),
 			);
 
 		containerEl.createEl("div", {
@@ -623,13 +847,13 @@ class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Match Threshold")
 			.setDesc(
-				"The minimum similarity score to return a match (between 0 and 1)"
+				"The minimum similarity score to return a match (between 0 and 1)",
 			)
 			.addText((text) =>
 				text
 					.setPlaceholder("Enter number")
 					.setValue(
-						this.plugin.settings.generativeSearch.matchThreshold.toString()
+						this.plugin.settings.generativeSearch.matchThreshold.toString(),
 					)
 					.onChange(async (value) => {
 						if (!isNaN(parseInt(value))) {
@@ -637,7 +861,7 @@ class SettingTab extends PluginSettingTab {
 								parseFloat(value);
 							await this.plugin.saveSettings();
 						}
-					})
+					}),
 			);
 
 		new Setting(containerEl)
@@ -647,7 +871,7 @@ class SettingTab extends PluginSettingTab {
 				text
 					.setPlaceholder("Enter integer")
 					.setValue(
-						this.plugin.settings.generativeSearch.matchCount.toString()
+						this.plugin.settings.generativeSearch.matchCount.toString(),
 					)
 					.onChange(async (value) => {
 						if (!isNaN(parseInt(value))) {
@@ -655,7 +879,7 @@ class SettingTab extends PluginSettingTab {
 								parseInt(value);
 							await this.plugin.saveSettings();
 						}
-					})
+					}),
 			);
 
 		new Setting(containerEl)
@@ -665,7 +889,7 @@ class SettingTab extends PluginSettingTab {
 				text
 					.setPlaceholder("Enter integer")
 					.setValue(
-						this.plugin.settings.generativeSearch.minContentLength.toString()
+						this.plugin.settings.generativeSearch.minContentLength.toString(),
 					)
 					.onChange(async (value) => {
 						if (!isNaN(parseInt(value))) {
@@ -673,7 +897,7 @@ class SettingTab extends PluginSettingTab {
 								parseInt(value);
 							await this.plugin.saveSettings();
 						}
-					})
+					}),
 			);
 	}
 }
